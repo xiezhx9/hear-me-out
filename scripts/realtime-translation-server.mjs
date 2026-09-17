@@ -18,6 +18,12 @@ import {
   LocalFunasrStreamSession,
 } from "./server/asr/local-funasr-stream.mjs";
 import {
+  LOCAL_NEMOTRON_STREAM_DEFAULT_ENDPOINT,
+  LOCAL_NEMOTRON_STREAM_DEFAULT_MODEL,
+  LOCAL_NEMOTRON_STREAM_PROVIDER,
+  LocalNemotronStreamSession,
+} from "./server/asr/local-nemotron-stream.mjs";
+import {
   LOCAL_HY_MT2_DEFAULT_BASE_URL,
   LOCAL_HY_MT2_DEFAULT_MODEL,
   LOCAL_HY_MT2_PROVIDER,
@@ -58,14 +64,18 @@ const defaultAsrSettings = {
     process.env.ASR_WS_URL ??
     (configuredAsrProvider === LOCAL_FUNASR_STREAM_PROVIDER
       ? LOCAL_FUNASR_STREAM_DEFAULT_ENDPOINT
-      : configuredAsrProvider === LOCAL_SENSEVOICE_PROVIDER
+      : configuredAsrProvider === LOCAL_NEMOTRON_STREAM_PROVIDER
+        ? LOCAL_NEMOTRON_STREAM_DEFAULT_ENDPOINT
+        : configuredAsrProvider === LOCAL_SENSEVOICE_PROVIDER
         ? LOCAL_SENSEVOICE_DEFAULT_ENDPOINT
         : volcUrl),
   model:
     process.env.ASR_MODEL ??
     (configuredAsrProvider === LOCAL_FUNASR_STREAM_PROVIDER
       ? LOCAL_FUNASR_STREAM_DEFAULT_MODEL
-      : configuredAsrProvider === LOCAL_SENSEVOICE_PROVIDER
+      : configuredAsrProvider === LOCAL_NEMOTRON_STREAM_PROVIDER
+        ? LOCAL_NEMOTRON_STREAM_DEFAULT_MODEL
+        : configuredAsrProvider === LOCAL_SENSEVOICE_PROVIDER
         ? LOCAL_SENSEVOICE_DEFAULT_MODEL
         : "doubao-seed-asr"),
 };
@@ -247,6 +257,7 @@ wss.on("connection", (client) => {
 
   async function connectAsr() {
     if (asrSettings.provider === LOCAL_FUNASR_STREAM_PROVIDER) return connectLocalFunasrStream();
+    if (asrSettings.provider === LOCAL_NEMOTRON_STREAM_PROVIDER) return connectLocalNemotronStream();
     if (asrSettings.provider === LOCAL_SENSEVOICE_PROVIDER) return connectLocalSenseVoiceHttp();
     if (asrSettings.provider === "aliyun") return connectAliyun();
     if (asrSettings.provider === "tencent") return connectTencent();
@@ -307,6 +318,39 @@ wss.on("connection", (client) => {
         },
         onMetrics: (metrics) => {
           if (DEBUG_CAPTION) console.log("[local-funasr-stream]", metrics);
+        },
+      },
+    );
+    localAsrSession = session;
+    try {
+      await session.start();
+      ready = true;
+      flushAudio(false);
+    } catch (error) {
+      if (localAsrSession === session) localAsrSession = null;
+      fail(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function connectLocalNemotronStream() {
+    if (!sessionActive || client.readyState !== WebSocket.OPEN || localAsrSession) return;
+    const session = new LocalNemotronStreamSession(
+      {
+        modelDir: process.env.ASR_MODEL_DIR,
+        model: asrSettings.model,
+        provider: process.env.SHERPA_ONNX_PROVIDER ?? "cpu",
+        numThreads: process.env.SHERPA_ONNX_NUM_THREADS,
+        language: "ja",
+        sampleRate: SAMPLE_RATE,
+      },
+      {
+        onTranscript: (text, meta) => handleStreamingTranscript(text, meta),
+        onError: (error) => {
+          if (localAsrSession === session) localAsrSession = null;
+          fail(error.message);
+        },
+        onMetrics: (metrics) => {
+          if (DEBUG_CAPTION) console.log("[local-nemotron-stream]", metrics);
         },
       },
     );
@@ -801,7 +845,7 @@ wss.on("connection", (client) => {
         void connectAsr();
         return;
       }
-      const ingressBytes = asrSettings.provider === LOCAL_FUNASR_STREAM_PROVIDER ? LOCAL_STREAM_INGRESS_BYTES : AUDIO_SEGMENT_BYTES;
+      const ingressBytes = isLocalStreamingAsrProvider(asrSettings.provider) ? LOCAL_STREAM_INGRESS_BYTES : AUDIO_SEGMENT_BYTES;
       while (audioBuffer.length >= ingressBytes) {
         const segment = audioBuffer.subarray(0, ingressBytes);
         audioBuffer = audioBuffer.subarray(ingressBytes);
@@ -993,7 +1037,7 @@ wss.on("connection", (client) => {
     stopFlushTimer();
     if (!pendingFragmentFirstSeenAt || !pendingFragmentText) return;
     const elapsed = Date.now() - pendingFragmentFirstSeenAt;
-    const flushAfterMs = asrSettings.provider === LOCAL_FUNASR_STREAM_PROVIDER ? LOCAL_SUBTITLE_FLUSH_PENDING_MS : CAPTION_FLUSH_PENDING_MS;
+    const flushAfterMs = isLocalStreamingAsrProvider(asrSettings.provider) ? LOCAL_SUBTITLE_FLUSH_PENDING_MS : CAPTION_FLUSH_PENDING_MS;
     const delay = Math.max(0, flushAfterMs - elapsed);
     flushTimer = setTimeout(() => {
       flushTimer = null;
@@ -1949,6 +1993,7 @@ function resolveAsrSettings(input = {}) {
 function normalizeAsrProvider(value) {
   const normalized = String(value ?? "").trim().toLowerCase();
   if (["local-funasr-stream", "funasr-stream", "funasr-ws", "funasr-websocket"].includes(normalized)) return LOCAL_FUNASR_STREAM_PROVIDER;
+  if (["local-nemotron-ja-stream", "nemotron-ja-stream", "sherpa-nemotron", "nemotron"].includes(normalized)) return LOCAL_NEMOTRON_STREAM_PROVIDER;
   if (["local-sensevoice-http", "local-sensevoice", "sensevoice", "funasr-http"].includes(normalized)) return LOCAL_SENSEVOICE_PROVIDER;
   if (["aliyun", "ali", "alibaba", "nls"].includes(normalized)) return "aliyun";
   if (["tencent", "tencentcloud", "qcloud"].includes(normalized)) return "tencent";
@@ -1958,11 +2003,16 @@ function normalizeAsrProvider(value) {
 }
 
 function isLocalAsrProvider(provider) {
-  return provider === LOCAL_FUNASR_STREAM_PROVIDER || provider === LOCAL_SENSEVOICE_PROVIDER;
+  return provider === LOCAL_FUNASR_STREAM_PROVIDER || provider === LOCAL_NEMOTRON_STREAM_PROVIDER || provider === LOCAL_SENSEVOICE_PROVIDER;
+}
+
+function isLocalStreamingAsrProvider(provider) {
+  return provider === LOCAL_FUNASR_STREAM_PROVIDER || provider === LOCAL_NEMOTRON_STREAM_PROVIDER;
 }
 
 function getAsrProviderLabel(provider) {
   if (provider === LOCAL_FUNASR_STREAM_PROVIDER) return "本地 FunASR 流式";
+  if (provider === LOCAL_NEMOTRON_STREAM_PROVIDER) return "本地 Nemotron 日语流式";
   if (provider === LOCAL_SENSEVOICE_PROVIDER) return "本地 SenseVoice HTTP";
   if (provider === "aliyun") return "阿里云百炼 / NLS";
   if (provider === "tencent") return "腾讯云 ASR";

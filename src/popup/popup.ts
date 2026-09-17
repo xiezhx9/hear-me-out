@@ -35,6 +35,15 @@ const ASR_PRESETS: Record<AsrProviderId, AsrPreset> = {
     },
     models: ["funasr-2pass"],
   },
+  "local-nemotron-ja-stream": {
+    hint: "使用本地 Sherpa-ONNX Nemotron 3.5 日语流式模型。识别语言固定为日语 ja，模型目录由后端 ASR_MODEL_DIR 指定。",
+    fields: ["endpoint", "model"],
+    defaults: {
+      endpoint: "local://sherpa-onnx",
+      model: "nemotron-ja-560ms-int8",
+    },
+    models: ["nemotron-ja-560ms-int8"],
+  },
   "local-sensevoice-http": {
     hint: "使用现有 SenseVoice 文件转写接口。它是近实时兼容模式，不适合低于 1 秒的字幕延迟。",
     fields: ["endpoint", "model"],

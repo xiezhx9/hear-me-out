@@ -101,7 +101,8 @@ npm run dev:server
 
 | 服务 | 说明 |
 |------|------|
-| 本地 FunASR 流式 | 推荐的低延迟路径；需另行部署兼容 `2pass` 协议的常驻流式模型，目标首字延迟低于 1 秒 |
+| 本地 Nemotron 日语流式 | 推荐的日语路径；Sherpa-ONNX 直接嵌入后端，识别语言固定为 `ja` |
+| 本地 FunASR 流式 | 中文兼容路径；需另行部署兼容 `2pass` 协议的常驻流式模型 |
 | 本地 SenseVoice HTTP | 兼容已部署的 GGUF 文件转写接口；近实时，不适合亚秒级体验 |
 | 火山引擎 / 豆包 | 默认推荐，流式语音识别 2.0 |
 | 阿里云百炼 / Qwen-ASR | 实时语音识别 |
@@ -139,7 +140,16 @@ TRANSLATION_PROVIDER=microsoft
 # TRANSLATION_PROVIDER=local-hy-mt2
 # AI_TRANSLATION_BASE_URL=http://127.0.0.1:8001/v1
 # AI_TRANSLATION_MODEL=hy-mt2
+
+# 本地 Nemotron 日语流式（推荐）
+# ASR_PROVIDER=local-nemotron-ja-stream
+# ASR_MODEL_DIR=C:\path\to\nemotron-ja-streaming
+# ASR_LANGUAGE=ja
+# SHERPA_ONNX_PROVIDER=cpu
+# SHERPA_ONNX_NUM_THREADS=2
 ```
+
+Nemotron 模型目录需要包含 `encoder.int8.onnx`、`decoder.int8.onnx`、`joiner.int8.onnx` 和 `tokens.txt`。项目使用 `sherpa-onnx-node` 的原生流式 API，每个浏览器会话对应一个识别流；日语语言会在会话创建时固定为 `ja`。当前 Windows npm 预编译包使用 CPU Execution Provider，启动脚本会因此将它配置为 CPU；请以本机实测的首个 partial 延迟为准。
 
 更多配置项请参考 `.env.example`。
 

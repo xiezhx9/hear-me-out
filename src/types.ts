@@ -38,6 +38,7 @@ export type StreamMode = "mock" | "websocket";
 
 export type AsrProviderId =
   | "local-funasr-stream"
+  | "local-nemotron-ja-stream"
   | "local-sensevoice-http"
   | "volcengine"
   | "aliyun"
