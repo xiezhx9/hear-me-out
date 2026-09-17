@@ -26,6 +26,24 @@ type TranslationPreset = {
 };
 
 const ASR_PRESETS: Record<AsrProviderId, AsrPreset> = {
+  "local-funasr-stream": {
+    hint: "使用常驻的 FunASR 流式服务，适合低于 1 秒的首字延迟。默认连接 ws://127.0.0.1:10095。",
+    fields: ["endpoint", "model"],
+    defaults: {
+      endpoint: "ws://127.0.0.1:10095",
+      model: "funasr-2pass",
+    },
+    models: ["funasr-2pass"],
+  },
+  "local-sensevoice-http": {
+    hint: "使用现有 SenseVoice 文件转写接口。它是近实时兼容模式，不适合低于 1 秒的字幕延迟。",
+    fields: ["endpoint", "model"],
+    defaults: {
+      endpoint: "http://127.0.0.1:8000/v1/audio/transcriptions",
+      model: "sensevoice",
+    },
+    models: ["sensevoice"],
+  },
   volcengine: {
     hint: "在火山引擎创建“豆包流式语音识别模型 2.0”应用后填写 App ID 和 Access Token。",
     fields: ["appId", "accessToken", "resourceId", "endpoint", "model"],
@@ -75,6 +93,11 @@ const ASR_PRESETS: Record<AsrProviderId, AsrPreset> = {
 };
 
 const TRANSLATION_PRESETS: Record<TranslationProviderId, TranslationPreset> = {
+  "local-hy-mt2": {
+    hint: "使用本机 Hy-MT2。请先启动 http://127.0.0.1:8001 的 llama.cpp 服务；本地默认不需要 API Key。",
+    defaults: { protocol: "openai", baseUrl: "http://127.0.0.1:8001/v1", model: "hy-mt2" },
+    models: ["hy-mt2"],
+  },
   microsoft: {
     hint: "无需 API Key，速度快；准确度一般，适合网页和字幕快速翻译。",
     defaults: { protocol: "openai", baseUrl: "", model: "" },
@@ -443,8 +466,10 @@ function applyTranslationPreset(provider: TranslationProviderId, forceDefaults: 
   setValueIfNeeded(translationModelInput, preset.defaults.model, forceDefaults);
 
   const isMicrosoft = provider === "microsoft";
+  const isLocalHyMt2 = provider === "local-hy-mt2";
   for (const row of document.querySelectorAll<HTMLElement>("[data-translation-field]")) {
-    row.hidden = isMicrosoft;
+    const field = row.dataset.translationField as keyof TranslationSettings | undefined;
+    row.hidden = isMicrosoft || (isLocalHyMt2 && field === "apiKey");
   }
 }
 

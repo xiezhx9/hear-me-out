@@ -303,10 +303,11 @@ async function translateWithMicrosoft(texts: string[], targetLanguage: string): 
  */
 async function translateBatch(texts: string[], targetLanguage: string, settings: TranslatorSettings): Promise<string[]> {
   const translation = settings.translation;
-  const hasAiKey = translation?.apiKey?.trim() && translation?.provider && translation.provider !== "microsoft";
+  const usesLocalHyMt2 = translation?.provider === "local-hy-mt2";
+  const hasAiKey = Boolean(translation?.apiKey?.trim() && translation?.provider && translation.provider !== "microsoft");
 
-  // No AI key → use built-in Microsoft translation (works out of the box)
-  if (!hasAiKey) {
+  // Local Hy-MT2 does not require a key. Other AI providers retain the existing key gate.
+  if (!usesLocalHyMt2 && !hasAiKey) {
     return translateWithMicrosoft(texts, targetLanguage);
   }
 

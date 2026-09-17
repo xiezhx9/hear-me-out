@@ -16,6 +16,7 @@
     "build": "node scripts/build.mjs",
     "dev:server": "node scripts/realtime-translation-server.mjs",
     "typecheck": "tsc --noEmit",
+    "test": "node --test",
     "clean": "rm -rf dist"
   },
   "devDependencies": {

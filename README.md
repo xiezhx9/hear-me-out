@@ -85,6 +85,7 @@ npm run dev:server
 
 | 服务 | 说明 |
 |------|------|
+| 本地 Hy-MT2 | llama.cpp OpenAI 兼容服务，不需要云端密钥 |
 | 微软翻译 | 免费，无需 API Key，速度快 |
 | DeepSeek | 国产 AI，性价比高 |
 | 小米 MiMo | 小米大模型 |
@@ -100,6 +101,8 @@ npm run dev:server
 
 | 服务 | 说明 |
 |------|------|
+| 本地 FunASR 流式 | 推荐的低延迟路径；需另行部署兼容 `2pass` 协议的常驻流式模型，目标首字延迟低于 1 秒 |
+| 本地 SenseVoice HTTP | 兼容已部署的 GGUF 文件转写接口；近实时，不适合亚秒级体验 |
 | 火山引擎 / 豆包 | 默认推荐，流式语音识别 2.0 |
 | 阿里云百炼 / Qwen-ASR | 实时语音识别 |
 | 腾讯云 ASR | 实时语音识别 |
@@ -126,6 +129,16 @@ TRANSLATION_PROVIDER=microsoft
 # AI_TRANSLATION_API_KEY=你的API密钥
 # AI_TRANSLATION_MODEL=deepseek-v4-flash
 # AI_TRANSLATION_DISABLE_THINKING=true
+
+# 本地实时 FunASR（推荐；需要先启动常驻 WebSocket 服务）
+# ASR_PROVIDER=local-funasr-stream
+# ASR_ENDPOINT=ws://127.0.0.1:10095
+# ASR_MODEL=funasr-2pass
+
+# 本地 Hy-MT2
+# TRANSLATION_PROVIDER=local-hy-mt2
+# AI_TRANSLATION_BASE_URL=http://127.0.0.1:8001/v1
+# AI_TRANSLATION_MODEL=hy-mt2
 ```
 
 更多配置项请参考 `.env.example`。

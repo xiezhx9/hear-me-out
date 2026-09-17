@@ -5,6 +5,25 @@ import { fileURLToPath } from "node:url";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { PDFParse } from "pdf-parse";
 import { WebSocket, WebSocketServer } from "ws";
+import {
+  LOCAL_SENSEVOICE_DEFAULT_ENDPOINT,
+  LOCAL_SENSEVOICE_DEFAULT_MODEL,
+  LOCAL_SENSEVOICE_PROVIDER,
+  LocalSenseVoiceSession,
+} from "./server/asr/local-sensevoice.mjs";
+import {
+  LOCAL_FUNASR_STREAM_DEFAULT_ENDPOINT,
+  LOCAL_FUNASR_STREAM_DEFAULT_MODEL,
+  LOCAL_FUNASR_STREAM_PROVIDER,
+  LocalFunasrStreamSession,
+} from "./server/asr/local-funasr-stream.mjs";
+import {
+  LOCAL_HY_MT2_DEFAULT_BASE_URL,
+  LOCAL_HY_MT2_DEFAULT_MODEL,
+  LOCAL_HY_MT2_PROVIDER,
+  getLocalHyMt2SystemPrompt,
+  isLocalHyMt2Provider,
+} from "./server/translation/local-hy-mt2.mjs";
 
 loadDotEnv();
 
@@ -23,8 +42,9 @@ const aiTranslationApiKey =
   process.env.AI_TRANSLATION_API_KEY ?? process.env.OPENAI_COMPATIBLE_API_KEY ?? process.env.DEEPSEEK_API_KEY;
 const aiTranslationModel = process.env.AI_TRANSLATION_MODEL ?? process.env.OPENAI_COMPATIBLE_MODEL ?? "deepseek-v4-flash";
 const aiTranslationDisableThinking = process.env.AI_TRANSLATION_DISABLE_THINKING !== "false";
+const configuredAsrProvider = normalizeAsrProvider(process.env.ASR_PROVIDER ?? "volcengine");
 const defaultAsrSettings = {
-  provider: normalizeAsrProvider(process.env.ASR_PROVIDER ?? "volcengine"),
+  provider: configuredAsrProvider,
   appId: process.env.ASR_APP_ID ?? appId ?? "",
   accessToken: process.env.ASR_ACCESS_TOKEN ?? accessToken ?? "",
   apiKey: process.env.ASR_API_KEY ?? "",
@@ -33,11 +53,32 @@ const defaultAsrSettings = {
   secretKey: process.env.ASR_SECRET_KEY ?? "",
   appKey: process.env.ASR_APP_KEY ?? "",
   resourceId,
-  endpoint: process.env.ASR_WS_URL ?? volcUrl,
-  model: process.env.ASR_MODEL ?? "doubao-seed-asr",
+  endpoint:
+    process.env.ASR_ENDPOINT ??
+    process.env.ASR_WS_URL ??
+    (configuredAsrProvider === LOCAL_FUNASR_STREAM_PROVIDER
+      ? LOCAL_FUNASR_STREAM_DEFAULT_ENDPOINT
+      : configuredAsrProvider === LOCAL_SENSEVOICE_PROVIDER
+        ? LOCAL_SENSEVOICE_DEFAULT_ENDPOINT
+        : volcUrl),
+  model:
+    process.env.ASR_MODEL ??
+    (configuredAsrProvider === LOCAL_FUNASR_STREAM_PROVIDER
+      ? LOCAL_FUNASR_STREAM_DEFAULT_MODEL
+      : configuredAsrProvider === LOCAL_SENSEVOICE_PROVIDER
+        ? LOCAL_SENSEVOICE_DEFAULT_MODEL
+        : "doubao-seed-asr"),
 };
 
 const translationProviderDefaults = {
+  [LOCAL_HY_MT2_PROVIDER]: {
+    provider: LOCAL_HY_MT2_PROVIDER,
+    protocol: "openai",
+    baseUrl: LOCAL_HY_MT2_DEFAULT_BASE_URL,
+    model: LOCAL_HY_MT2_DEFAULT_MODEL,
+    apiKey: "",
+    disableThinking: true,
+  },
   microsoft: { provider: "microsoft", protocol: "openai", baseUrl: "", model: "", apiKey: "", disableThinking: true },
   deepseek: {
     provider: "deepseek",
@@ -91,6 +132,8 @@ const translationProviderDefaults = {
 const SAMPLE_RATE = 16000;
 const AUDIO_SEGMENT_MS = 200;
 const AUDIO_SEGMENT_BYTES = Math.floor((SAMPLE_RATE * 2 * AUDIO_SEGMENT_MS) / 1000);
+const LOCAL_STREAM_INGRESS_MS = 40;
+const LOCAL_STREAM_INGRESS_BYTES = Math.floor((SAMPLE_RATE * 2 * LOCAL_STREAM_INGRESS_MS) / 1000);
 const AUDIO_BUFFER_MAX_MS = readPositiveIntegerEnv("ASR_AUDIO_BUFFER_MAX_MS", 8_000);
 const AUDIO_BUFFER_MAX_BYTES = Math.max(AUDIO_SEGMENT_BYTES, Math.floor((SAMPLE_RATE * 2 * AUDIO_BUFFER_MAX_MS) / 1000));
 const ASR_KEEPALIVE_MS = readPositiveIntegerEnv("ASR_KEEPALIVE_MS", 1_000);
@@ -107,6 +150,11 @@ const CAPTION_TRANSLATION_CONCURRENCY = 3;
 const CAPTION_PROCESSED_FRAGMENT_LIMIT = readPositiveIntegerEnv("SUBTITLE_PROCESSED_FRAGMENT_LIMIT", 50_000);
 const CAPTION_RECENT_FRAGMENT_LIMIT = 240;
 const SUBTITLE_TRANSLATION_TIMEOUT_MS = readPositiveIntegerEnv("SUBTITLE_TRANSLATION_TIMEOUT_MS", 8_000);
+const LOCAL_SUBTITLE_FLUSH_PENDING_MS = readPositiveIntegerEnv("LOCAL_SUBTITLE_FLUSH_PENDING_MS", 400);
+const LOCAL_ASR_WINDOW_MS = readPositiveIntegerEnv("LOCAL_ASR_WINDOW_MS", 1_200);
+const LOCAL_ASR_OVERLAP_MS = readPositiveIntegerEnv("LOCAL_ASR_OVERLAP_MS", 200);
+const LOCAL_ASR_MAX_PENDING_MS = readPositiveIntegerEnv("LOCAL_ASR_MAX_PENDING_MS", 8_000);
+const LOCAL_ASR_TIMEOUT_MS = readPositiveIntegerEnv("LOCAL_ASR_TIMEOUT_MS", 10_000);
 const PDF_MAX_PARAGRAPHS = 240;
 const PDF_TRANSLATION_BATCH_SIZE = 8;
 const PDF_TRANSLATION_CONCURRENCY = 2;
@@ -160,6 +208,12 @@ wss.on("connection", (client) => {
   let pendingFragmentText = "";
   let pendingFragmentFirstSeenAt = 0;
   let flushTimer = null;
+  let localAsrSession = null;
+  let streamingPreviewText = "";
+  let streamingPreviewRevision = 0;
+  let streamingSessionGeneration = 0;
+  let pendingStreamingTranslation = null;
+  let streamingTranslationRunning = false;
 
   function sendCaption(sourceText, translatedText = "", isFinal = false, revision = captionRevision) {
     if (client.readyState !== WebSocket.OPEN) return;
@@ -192,11 +246,88 @@ wss.on("connection", (client) => {
   }
 
   async function connectAsr() {
+    if (asrSettings.provider === LOCAL_FUNASR_STREAM_PROVIDER) return connectLocalFunasrStream();
+    if (asrSettings.provider === LOCAL_SENSEVOICE_PROVIDER) return connectLocalSenseVoiceHttp();
     if (asrSettings.provider === "aliyun") return connectAliyun();
     if (asrSettings.provider === "tencent") return connectTencent();
     if (asrSettings.provider === "baidu") return connectBaidu();
     if (asrSettings.provider === "iflytek") return connectIflytek();
     return connectVolcengine();
+  }
+
+  async function connectLocalSenseVoiceHttp() {
+    if (!sessionActive || client.readyState !== WebSocket.OPEN || localAsrSession) return;
+    const session = new LocalSenseVoiceSession(
+      {
+        endpoint: asrSettings.endpoint || LOCAL_SENSEVOICE_DEFAULT_ENDPOINT,
+        model: asrSettings.model || LOCAL_SENSEVOICE_DEFAULT_MODEL,
+        sampleRate: SAMPLE_RATE,
+        windowMs: LOCAL_ASR_WINDOW_MS,
+        overlapMs: LOCAL_ASR_OVERLAP_MS,
+        maxPendingMs: LOCAL_ASR_MAX_PENDING_MS,
+        timeoutMs: LOCAL_ASR_TIMEOUT_MS,
+      },
+      {
+        onTranscript: (text) => handleTranscriptText(text),
+        onError: (error) => fail(error.message),
+        onMetrics: (metrics) => {
+          if (DEBUG_CAPTION) console.log("[local-sensevoice]", metrics);
+        },
+      },
+    );
+    localAsrSession = session;
+    try {
+      await session.start();
+      ready = true;
+      flushAudio(false);
+    } catch (error) {
+      if (localAsrSession === session) localAsrSession = null;
+      fail(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function connectLocalFunasrStream() {
+    if (!sessionActive || client.readyState !== WebSocket.OPEN || localAsrSession) return;
+    const session = new LocalFunasrStreamSession(
+      {
+        endpoint: asrSettings.endpoint || LOCAL_FUNASR_STREAM_DEFAULT_ENDPOINT,
+        model: asrSettings.model || LOCAL_FUNASR_STREAM_DEFAULT_MODEL,
+        sampleRate: SAMPLE_RATE,
+        maxPendingMs: 2_400,
+        wavName: captionId,
+      },
+      {
+        onTranscript: (text, meta) => handleStreamingTranscript(text, meta),
+        onError: (error) => {
+          if (localAsrSession === session) {
+            localAsrSession = null;
+            if (sessionActive) setTimeout(() => void connectAsr(), 500);
+          }
+          fail(error.message);
+        },
+        onMetrics: (metrics) => {
+          if (DEBUG_CAPTION) console.log("[local-funasr-stream]", metrics);
+        },
+      },
+    );
+    localAsrSession = session;
+    try {
+      await session.start();
+      ready = true;
+      flushAudio(false);
+    } catch (error) {
+      if (localAsrSession === session) localAsrSession = null;
+      fail(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function resetLocalAsr() {
+    const session = localAsrSession;
+    localAsrSession = null;
+    streamingPreviewText = "";
+    streamingSessionGeneration += 1;
+    pendingStreamingTranslation = null;
+    if (session) void session.close();
   }
 
   async function connectVolcengine() {
@@ -582,6 +713,7 @@ wss.on("connection", (client) => {
   }
 
   function resetUpstream(socket = upstream, closeSocket = true) {
+    resetLocalAsr();
     if (socket && closeSocket && socket.readyState !== WebSocket.CLOSED && socket.readyState !== WebSocket.CLOSING) {
       socket.close();
     }
@@ -592,6 +724,21 @@ wss.on("connection", (client) => {
       upstreamStartedAt = 0;
       lastAudioSentAt = 0;
     }
+  }
+
+  async function stopRealtimeSession(flushLocalTail) {
+    const localSession = localAsrSession;
+    if (flushLocalTail && localSession && isLocalAsrProvider(asrSettings.provider)) {
+      await localSession.stop({ waitForFinal: true }).catch((error) => fail(error instanceof Error ? error.message : String(error)));
+    }
+    sessionActive = false;
+    audioBuffer = Buffer.alloc(0);
+    pendingCaptionFragments = [];
+    pendingFragmentText = "";
+    pendingFragmentFirstSeenAt = 0;
+    stopFlushTimer();
+    stopKeepAliveTimer();
+    resetUpstream(upstream);
   }
 
   client.on("message", (data, isBinary) => {
@@ -621,6 +768,8 @@ wss.on("connection", (client) => {
         captionRevision = 0;
         translationInFlightCount = 0;
         sentWavHeader = false;
+        streamingPreviewRevision = 0;
+        streamingSessionGeneration += 1;
         upstreamStartedAt = 0;
         lastAudioSentAt = 0;
         startKeepAliveTimer();
@@ -628,14 +777,7 @@ wss.on("connection", (client) => {
       }
 
       if (event.type === "session.stop") {
-        sessionActive = false;
-        audioBuffer = Buffer.alloc(0);
-        pendingCaptionFragments = [];
-        pendingFragmentText = "";
-        pendingFragmentFirstSeenAt = 0;
-        stopFlushTimer();
-        stopKeepAliveTimer();
-        resetUpstream(upstream);
+        void stopRealtimeSession(true);
       }
       return;
     }
@@ -649,18 +791,28 @@ wss.on("connection", (client) => {
   });
 
   client.on("close", () => {
-    sessionActive = false;
-    audioBuffer = Buffer.alloc(0);
-    pendingCaptionFragments = [];
-    pendingFragmentText = "";
-    pendingFragmentFirstSeenAt = 0;
-    stopFlushTimer();
-    stopKeepAliveTimer();
-    resetUpstream(upstream);
+    void stopRealtimeSession(false);
   });
 
   function flushAudio(isLast) {
     if (!sessionActive) return;
+    if (isLocalAsrProvider(asrSettings.provider)) {
+      if (!localAsrSession) {
+        void connectAsr();
+        return;
+      }
+      const ingressBytes = asrSettings.provider === LOCAL_FUNASR_STREAM_PROVIDER ? LOCAL_STREAM_INGRESS_BYTES : AUDIO_SEGMENT_BYTES;
+      while (audioBuffer.length >= ingressBytes) {
+        const segment = audioBuffer.subarray(0, ingressBytes);
+        audioBuffer = audioBuffer.subarray(ingressBytes);
+        localAsrSession.pushPcm(segment);
+      }
+      if (isLast && audioBuffer.length > 0) {
+        localAsrSession.pushPcm(audioBuffer);
+        audioBuffer = Buffer.alloc(0);
+      }
+      return;
+    }
     if (!ready || upstream?.readyState !== WebSocket.OPEN) {
       if (!upstream || upstream.readyState === WebSocket.CLOSED || upstream.readyState === WebSocket.CLOSING) {
         void connectAsr();
@@ -749,6 +901,70 @@ wss.on("connection", (client) => {
     }
   }
 
+  function handleStreamingTranscript(text, meta = {}) {
+    const normalized = normalizeTranscriptSpacing(text);
+    if (!normalized) return;
+
+    if (meta.isFinal) {
+      streamingPreviewText = "";
+      pendingStreamingTranslation = null;
+      handleTranscriptText(normalized);
+      return;
+    }
+
+    streamingPreviewText = mergeStreamingPreview(streamingPreviewText, normalized);
+    if (!streamingPreviewText) return;
+    streamingPreviewRevision += 1;
+    sendCaption(streamingPreviewText, "", false, streamingPreviewRevision);
+    queueStreamingTranslation(streamingPreviewText, streamingPreviewRevision, streamingSessionGeneration);
+  }
+
+  function mergeStreamingPreview(previous, incoming) {
+    if (!previous) return incoming;
+    if (incoming.startsWith(previous)) return incoming;
+    if (previous.endsWith(incoming)) return previous;
+    const maxLength = Math.min(previous.length, incoming.length);
+    for (let length = maxLength; length >= 2; length -= 1) {
+      if (previous.slice(-length) === incoming.slice(0, length)) return `${previous}${incoming.slice(length)}`;
+    }
+    return `${previous}${incoming}`;
+  }
+
+  function queueStreamingTranslation(text, revision, generation) {
+    pendingStreamingTranslation = { text, revision, generation };
+    if (!streamingTranslationRunning) void runStreamingTranslation();
+  }
+
+  async function runStreamingTranslation() {
+    streamingTranslationRunning = true;
+    try {
+      while (pendingStreamingTranslation) {
+        const next = pendingStreamingTranslation;
+        pendingStreamingTranslation = null;
+        try {
+          const translated = await translateTextWithTimeout(
+            next.text,
+            targetLanguage,
+            SUBTITLE_TRANSLATION_TIMEOUT_MS,
+            sessionTranslationConfig,
+          );
+          if (
+            next.generation === streamingSessionGeneration &&
+            next.revision === streamingPreviewRevision &&
+            streamingPreviewText
+          ) {
+            sendCaption(next.text, translated, false, next.revision);
+          }
+        } catch {
+          // Keep partial source captions visible if the local translation model is busy.
+        }
+      }
+    } finally {
+      streamingTranslationRunning = false;
+      if (pendingStreamingTranslation) void runStreamingTranslation();
+    }
+  }
+
   function extractTrailingText(text) {
     const sentencePattern = /[^.!?。！？]+[.!?。！？]+/gu;
     let lastCompleteEnd = 0;
@@ -777,7 +993,8 @@ wss.on("connection", (client) => {
     stopFlushTimer();
     if (!pendingFragmentFirstSeenAt || !pendingFragmentText) return;
     const elapsed = Date.now() - pendingFragmentFirstSeenAt;
-    const delay = Math.max(0, CAPTION_FLUSH_PENDING_MS - elapsed);
+    const flushAfterMs = asrSettings.provider === LOCAL_FUNASR_STREAM_PROVIDER ? LOCAL_SUBTITLE_FLUSH_PENDING_MS : CAPTION_FLUSH_PENDING_MS;
+    const delay = Math.max(0, flushAfterMs - elapsed);
     flushTimer = setTimeout(() => {
       flushTimer = null;
       flushPendingFragment();
@@ -793,6 +1010,7 @@ wss.on("connection", (client) => {
 
   function startKeepAliveTimer() {
     stopKeepAliveTimer();
+    if (isLocalAsrProvider(asrSettings.provider)) return;
     keepAliveTimer = setInterval(() => {
       if (!sessionActive || client.readyState !== WebSocket.OPEN) return;
 
@@ -919,8 +1137,9 @@ function enqueueCaptionFragments(fragments) {
 server.listen(port, () => {
   console.log(`Realtime ASR translation service listening on ws://localhost:${port}/realtime`);
   console.log(`ASR provider: ${defaultAsrSettings.provider}`);
-  console.log(`Resource ID: ${defaultAsrSettings.resourceId}`);
-  if (!defaultAsrSettings.appId || !defaultAsrSettings.accessToken) {
+  console.log(`ASR endpoint: ${defaultAsrSettings.endpoint}`);
+  if (!isLocalAsrProvider(defaultAsrSettings.provider)) console.log(`Resource ID: ${defaultAsrSettings.resourceId}`);
+  if (!isLocalAsrProvider(defaultAsrSettings.provider) && (!defaultAsrSettings.appId || !defaultAsrSettings.accessToken)) {
     console.warn("VOLCENGINE_APP_ID or VOLCENGINE_ACCESS_TOKEN is missing.");
   }
 });
@@ -1461,7 +1680,7 @@ async function translateTextsWithMicrosoft(cleanTexts, targetLanguage, signal) {
 
 async function translateTextsWithAi(cleanTexts, targetLanguage, signal, options = {}) {
   const config = resolveTranslationConfig(options.config ?? "ai", translationProvider);
-  if (!config.apiKey || !config.baseUrl || !config.model) {
+  if ((!config.apiKey && !isLocalHyMt2Provider(config.provider)) || !config.baseUrl || !config.model) {
     return translateTextsWithMicrosoft(cleanTexts, targetLanguage, signal);
   }
 
@@ -1487,7 +1706,9 @@ async function translateTextsWithAi(cleanTexts, targetLanguage, signal, options 
     messages: [
       {
         role: "system",
-        content: getAiTranslationSystemPrompt(profile, targetLanguage),
+        content: isLocalHyMt2Provider(config.provider)
+          ? getLocalHyMt2SystemPrompt(profile, targetLanguage)
+          : getAiTranslationSystemPrompt(profile, targetLanguage),
       },
       {
         role: "user",
@@ -1515,7 +1736,9 @@ async function translateTextsWithAi(cleanTexts, targetLanguage, signal, options 
   }
   const result = await response.json();
   const raw = result?.choices?.[0]?.message?.content ?? "";
-  const translations = coerceJsonArray(raw, cleanTexts.length).map((text, index) => text || cached.translations[index] || "");
+  const translations = coerceJsonArray(raw, cleanTexts.length, {
+    strictJson: isLocalHyMt2Provider(config.provider),
+  }).map((text, index) => text || cached.translations[index] || "");
   setCachedTranslations(cleanTexts, targetLanguage, cacheProvider, translations);
   return translations;
 }
@@ -1725,6 +1948,8 @@ function resolveAsrSettings(input = {}) {
 
 function normalizeAsrProvider(value) {
   const normalized = String(value ?? "").trim().toLowerCase();
+  if (["local-funasr-stream", "funasr-stream", "funasr-ws", "funasr-websocket"].includes(normalized)) return LOCAL_FUNASR_STREAM_PROVIDER;
+  if (["local-sensevoice-http", "local-sensevoice", "sensevoice", "funasr-http"].includes(normalized)) return LOCAL_SENSEVOICE_PROVIDER;
   if (["aliyun", "ali", "alibaba", "nls"].includes(normalized)) return "aliyun";
   if (["tencent", "tencentcloud", "qcloud"].includes(normalized)) return "tencent";
   if (["baidu", "baiducloud"].includes(normalized)) return "baidu";
@@ -1732,7 +1957,13 @@ function normalizeAsrProvider(value) {
   return "volcengine";
 }
 
+function isLocalAsrProvider(provider) {
+  return provider === LOCAL_FUNASR_STREAM_PROVIDER || provider === LOCAL_SENSEVOICE_PROVIDER;
+}
+
 function getAsrProviderLabel(provider) {
+  if (provider === LOCAL_FUNASR_STREAM_PROVIDER) return "本地 FunASR 流式";
+  if (provider === LOCAL_SENSEVOICE_PROVIDER) return "本地 SenseVoice HTTP";
   if (provider === "aliyun") return "阿里云百炼 / NLS";
   if (provider === "tencent") return "腾讯云 ASR";
   if (provider === "baidu") return "百度智能云 ASR";
@@ -1879,6 +2110,7 @@ function resolveTranslationConfig(input, fallbackProvider = translationProvider)
   };
 }
 function getTranslationProviderLabel(provider) {
+  if (provider === LOCAL_HY_MT2_PROVIDER) return "本地 Hy-MT2";
   if (provider === "deepseek") return "DeepSeek";
   if (provider === "kimi") return "Kimi";
   if (provider === "qwen") return "通义千问";
@@ -1897,6 +2129,7 @@ function normalizeTranslationProtocol(value) {
 
 function normalizeTranslationProvider(value) {
   const normalized = String(value).trim().toLowerCase();
+  if (["local-hy-mt2", "hy-mt2", "hymt2"].includes(normalized)) return LOCAL_HY_MT2_PROVIDER;
   if (["balanced", "page", "web", "webpage"].includes(normalized)) return "balanced";
   if (["accurate", "document", "pdf", "context", "contextual"].includes(normalized)) return "accurate";
   if (["deepseek", "kimi", "qwen", "glm", "minimax", "mimo", "custom"].includes(normalized)) return normalized;
@@ -1905,7 +2138,7 @@ function normalizeTranslationProvider(value) {
 }
 
 function isAiTranslationProvider(provider) {
-  return ["ai", "deepseek", "kimi", "qwen", "glm", "minimax", "mimo", "custom"].includes(provider);
+  return [LOCAL_HY_MT2_PROVIDER, "ai", "deepseek", "kimi", "qwen", "glm", "minimax", "mimo", "custom"].includes(provider);
 }
 
 function isReasoningModel(model) {
@@ -1913,6 +2146,7 @@ function isReasoningModel(model) {
 }
 
 function getAiAuthHeaders(config, protocol = config.protocol) {
+  if (!config.apiKey) return {};
   if (config.provider === "mimo") return { "api-key": config.apiKey };
   if (protocol === "anthropic") return { "x-api-key": config.apiKey };
   return { Authorization: `Bearer ${config.apiKey}` };
@@ -1946,7 +2180,7 @@ function extractAnthropicText(result) {
     .trim();
 }
 
-function coerceJsonArray(raw, expectedLength) {
+function coerceJsonArray(raw, expectedLength, { strictJson = false } = {}) {
   const trimmed = String(raw).trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
   try {
     const parsed = JSON.parse(trimmed);
@@ -1955,6 +2189,7 @@ function coerceJsonArray(raw, expectedLength) {
   } catch {
     // Fall through to line-based parsing for providers that ignore the JSON-only instruction.
   }
+  if (strictJson) return Array(expectedLength).fill("");
   return normalizeTranslationArray(trimmed.split(/\n+/).map((line) => line.replace(/^\s*[-*\d.)]+\s*/, "")), expectedLength);
 }
 

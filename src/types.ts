@@ -36,8 +36,16 @@ export type PageTranslateProgress = { type: "page:translate:progress"; runId: nu
 
 export type StreamMode = "mock" | "websocket";
 
-export type AsrProviderId = "volcengine" | "aliyun" | "tencent" | "baidu" | "iflytek";
+export type AsrProviderId =
+  | "local-funasr-stream"
+  | "local-sensevoice-http"
+  | "volcengine"
+  | "aliyun"
+  | "tencent"
+  | "baidu"
+  | "iflytek";
 export type TranslationProviderId =
+  | "local-hy-mt2"
   | "microsoft"
   | "deepseek"
   | "kimi"
@@ -104,7 +112,7 @@ export interface CaptionUpdate {
 }
 
 export const DEFAULT_SETTINGS: TranslatorSettings = {
-  schemaVersion: 7,
+  schemaVersion: 8,
   enabled: true,
   targetLanguage: "zh-CN",
   backendUrl: "ws://localhost:8787/realtime",
