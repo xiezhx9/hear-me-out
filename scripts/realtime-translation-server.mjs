@@ -24,6 +24,12 @@ import {
   LocalNemotronStreamSession,
 } from "./server/asr/local-nemotron-stream.mjs";
 import {
+  LOCAL_VOSK_STREAM_DEFAULT_ENDPOINT,
+  LOCAL_VOSK_STREAM_DEFAULT_MODEL,
+  LOCAL_VOSK_STREAM_PROVIDER,
+  LocalVoskStreamSession,
+} from "./server/asr/local-vosk-stream.mjs";
+import {
   LOCAL_HY_MT2_DEFAULT_BASE_URL,
   LOCAL_HY_MT2_DEFAULT_MODEL,
   LOCAL_HY_MT2_PROVIDER,
@@ -66,6 +72,8 @@ const defaultAsrSettings = {
       ? LOCAL_FUNASR_STREAM_DEFAULT_ENDPOINT
       : configuredAsrProvider === LOCAL_NEMOTRON_STREAM_PROVIDER
         ? LOCAL_NEMOTRON_STREAM_DEFAULT_ENDPOINT
+        : configuredAsrProvider === LOCAL_VOSK_STREAM_PROVIDER
+          ? LOCAL_VOSK_STREAM_DEFAULT_ENDPOINT
         : configuredAsrProvider === LOCAL_SENSEVOICE_PROVIDER
         ? LOCAL_SENSEVOICE_DEFAULT_ENDPOINT
         : volcUrl),
@@ -75,6 +83,8 @@ const defaultAsrSettings = {
       ? LOCAL_FUNASR_STREAM_DEFAULT_MODEL
       : configuredAsrProvider === LOCAL_NEMOTRON_STREAM_PROVIDER
         ? LOCAL_NEMOTRON_STREAM_DEFAULT_MODEL
+        : configuredAsrProvider === LOCAL_VOSK_STREAM_PROVIDER
+          ? LOCAL_VOSK_STREAM_DEFAULT_MODEL
         : configuredAsrProvider === LOCAL_SENSEVOICE_PROVIDER
         ? LOCAL_SENSEVOICE_DEFAULT_MODEL
         : "doubao-seed-asr"),
@@ -160,7 +170,9 @@ const CAPTION_TRANSLATION_CONCURRENCY = 3;
 const CAPTION_PROCESSED_FRAGMENT_LIMIT = readPositiveIntegerEnv("SUBTITLE_PROCESSED_FRAGMENT_LIMIT", 50_000);
 const CAPTION_RECENT_FRAGMENT_LIMIT = 240;
 const SUBTITLE_TRANSLATION_TIMEOUT_MS = readPositiveIntegerEnv("SUBTITLE_TRANSLATION_TIMEOUT_MS", 8_000);
-const LOCAL_SUBTITLE_FLUSH_PENDING_MS = readPositiveIntegerEnv("LOCAL_SUBTITLE_FLUSH_PENDING_MS", 400);
+const LOCAL_SUBTITLE_FLUSH_PENDING_MS = readPositiveIntegerEnv("LOCAL_SUBTITLE_FLUSH_PENDING_MS", 160);
+const STREAMING_TRANSLATION_DEBOUNCE_MS = readPositiveIntegerEnv("STREAMING_TRANSLATION_DEBOUNCE_MS", 80);
+const STREAMING_TRANSLATION_MIN_CHARS = readPositiveIntegerEnv("STREAMING_TRANSLATION_MIN_CHARS", 2);
 const LOCAL_ASR_WINDOW_MS = readPositiveIntegerEnv("LOCAL_ASR_WINDOW_MS", 1_200);
 const LOCAL_ASR_OVERLAP_MS = readPositiveIntegerEnv("LOCAL_ASR_OVERLAP_MS", 200);
 const LOCAL_ASR_MAX_PENDING_MS = readPositiveIntegerEnv("LOCAL_ASR_MAX_PENDING_MS", 8_000);
@@ -224,6 +236,8 @@ wss.on("connection", (client) => {
   let streamingSessionGeneration = 0;
   let pendingStreamingTranslation = null;
   let streamingTranslationRunning = false;
+  let streamingTranslationTimer = null;
+  let activeStreamingTranslationAbort = null;
 
   function sendCaption(sourceText, translatedText = "", isFinal = false, revision = captionRevision) {
     if (client.readyState !== WebSocket.OPEN) return;
@@ -258,6 +272,7 @@ wss.on("connection", (client) => {
   async function connectAsr() {
     if (asrSettings.provider === LOCAL_FUNASR_STREAM_PROVIDER) return connectLocalFunasrStream();
     if (asrSettings.provider === LOCAL_NEMOTRON_STREAM_PROVIDER) return connectLocalNemotronStream();
+    if (asrSettings.provider === LOCAL_VOSK_STREAM_PROVIDER) return connectLocalVoskStream();
     if (asrSettings.provider === LOCAL_SENSEVOICE_PROVIDER) return connectLocalSenseVoiceHttp();
     if (asrSettings.provider === "aliyun") return connectAliyun();
     if (asrSettings.provider === "tencent") return connectTencent();
@@ -340,7 +355,7 @@ wss.on("connection", (client) => {
         model: asrSettings.model,
         provider: process.env.SHERPA_ONNX_PROVIDER ?? "cpu",
         numThreads: process.env.SHERPA_ONNX_NUM_THREADS,
-        language: "ja",
+        language: process.env.ASR_LANGUAGE || "ja",
         sampleRate: SAMPLE_RATE,
       },
       {
@@ -365,12 +380,47 @@ wss.on("connection", (client) => {
     }
   }
 
+  async function connectLocalVoskStream() {
+    if (!sessionActive || client.readyState !== WebSocket.OPEN || localAsrSession) return;
+    const session = new LocalVoskStreamSession(
+      {
+        endpoint: asrSettings.endpoint || LOCAL_VOSK_STREAM_DEFAULT_ENDPOINT,
+        model: asrSettings.model || LOCAL_VOSK_STREAM_DEFAULT_MODEL,
+        sampleRate: SAMPLE_RATE,
+      },
+      {
+        onTranscript: (text, meta) => handleStreamingTranscript(text, meta),
+        onError: (error) => {
+          if (localAsrSession === session) {
+            localAsrSession = null;
+            if (sessionActive) setTimeout(() => void connectAsr(), 500);
+          }
+          fail(error.message);
+        },
+        onMetrics: (metrics) => {
+          if (DEBUG_CAPTION) console.log("[local-vosk-stream]", metrics);
+        },
+      },
+    );
+    localAsrSession = session;
+    try {
+      await session.start();
+      ready = true;
+      flushAudio(false);
+    } catch (error) {
+      if (localAsrSession === session) localAsrSession = null;
+      fail(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   function resetLocalAsr() {
     const session = localAsrSession;
     localAsrSession = null;
     streamingPreviewText = "";
     streamingSessionGeneration += 1;
     pendingStreamingTranslation = null;
+    stopStreamingTranslationTimer();
+    abortActiveStreamingTranslation();
     if (session) void session.close();
   }
 
@@ -814,6 +864,8 @@ wss.on("connection", (client) => {
         sentWavHeader = false;
         streamingPreviewRevision = 0;
         streamingSessionGeneration += 1;
+        stopStreamingTranslationTimer();
+        abortActiveStreamingTranslation();
         upstreamStartedAt = 0;
         lastAudioSentAt = 0;
         startKeepAliveTimer();
@@ -952,6 +1004,8 @@ wss.on("connection", (client) => {
     if (meta.isFinal) {
       streamingPreviewText = "";
       pendingStreamingTranslation = null;
+      stopStreamingTranslationTimer();
+      abortActiveStreamingTranslation();
       handleTranscriptText(normalized);
       return;
     }
@@ -960,7 +1014,7 @@ wss.on("connection", (client) => {
     if (!streamingPreviewText) return;
     streamingPreviewRevision += 1;
     sendCaption(streamingPreviewText, "", false, streamingPreviewRevision);
-    queueStreamingTranslation(streamingPreviewText, streamingPreviewRevision, streamingSessionGeneration);
+    scheduleStreamingTranslation(streamingPreviewText, streamingPreviewRevision, streamingSessionGeneration);
   }
 
   function mergeStreamingPreview(previous, incoming) {
@@ -974,6 +1028,27 @@ wss.on("connection", (client) => {
     return `${previous}${incoming}`;
   }
 
+  function scheduleStreamingTranslation(text, revision, generation) {
+    stopStreamingTranslationTimer();
+    if (text.length < STREAMING_TRANSLATION_MIN_CHARS && !/[.!?。！？]/u.test(text)) return;
+    streamingTranslationTimer = setTimeout(() => {
+      streamingTranslationTimer = null;
+      if (generation !== streamingSessionGeneration || revision !== streamingPreviewRevision) return;
+      queueStreamingTranslation(text, revision, generation);
+    }, STREAMING_TRANSLATION_DEBOUNCE_MS);
+  }
+
+  function stopStreamingTranslationTimer() {
+    if (!streamingTranslationTimer) return;
+    clearTimeout(streamingTranslationTimer);
+    streamingTranslationTimer = null;
+  }
+
+  function abortActiveStreamingTranslation() {
+    activeStreamingTranslationAbort?.abort();
+    activeStreamingTranslationAbort = null;
+  }
+
   function queueStreamingTranslation(text, revision, generation) {
     pendingStreamingTranslation = { text, revision, generation };
     if (!streamingTranslationRunning) void runStreamingTranslation();
@@ -985,12 +1060,15 @@ wss.on("connection", (client) => {
       while (pendingStreamingTranslation) {
         const next = pendingStreamingTranslation;
         pendingStreamingTranslation = null;
+        const controller = new AbortController();
+        activeStreamingTranslationAbort = controller;
         try {
           const translated = await translateTextWithTimeout(
             next.text,
             targetLanguage,
             SUBTITLE_TRANSLATION_TIMEOUT_MS,
             sessionTranslationConfig,
+            controller.signal,
           );
           if (
             next.generation === streamingSessionGeneration &&
@@ -1001,6 +1079,8 @@ wss.on("connection", (client) => {
           }
         } catch {
           // Keep partial source captions visible if the local translation model is busy.
+        } finally {
+          if (activeStreamingTranslationAbort === controller) activeStreamingTranslationAbort = null;
         }
       }
     } finally {
@@ -1111,7 +1191,7 @@ function enqueueCaptionFragments(fragments) {
   let translationInFlightCount = 0;
 
   async function runCaptionTranslationQueue() {
-    while (pendingCaptionFragments.length > 0 && translationInFlightCount < CAPTION_TRANSLATION_CONCURRENCY) {
+    while (pendingCaptionFragments.length > 0 && translationInFlightCount < getCaptionTranslationConcurrency()) {
       const text = pendingCaptionFragments.shift();
       if (!text) break;
       translationInFlightCount += 1;
@@ -1131,6 +1211,11 @@ function enqueueCaptionFragments(fragments) {
         }
       })();
     }
+  }
+
+  function getCaptionTranslationConcurrency() {
+    if (isLocalStreamingAsrProvider(asrSettings.provider) && isLocalHyMt2Provider(sessionTranslationConfig.provider)) return 1;
+    return CAPTION_TRANSLATION_CONCURRENCY;
   }
 
   function extractReadyCaptionFragments(text) {
@@ -1186,6 +1271,7 @@ server.listen(port, () => {
   if (!isLocalAsrProvider(defaultAsrSettings.provider) && (!defaultAsrSettings.appId || !defaultAsrSettings.accessToken)) {
     console.warn("VOLCENGINE_APP_ID or VOLCENGINE_ACCESS_TOKEN is missing.");
   }
+
 });
 
 async function handleHttpRequest(request, response) {
@@ -1511,13 +1597,17 @@ async function translateText(text, targetLanguage, signal, config) {
   return translation ?? "";
 }
 
-async function translateTextWithTimeout(text, targetLanguage, timeoutMs, config) {
+async function translateTextWithTimeout(text, targetLanguage, timeoutMs, config, parentSignal) {
   const controller = new AbortController();
+  const abortFromParent = () => controller.abort();
+  if (parentSignal?.aborted) controller.abort();
+  else parentSignal?.addEventListener("abort", abortFromParent, { once: true });
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await translateText(text, targetLanguage, controller.signal, config);
   } finally {
     clearTimeout(timer);
+    parentSignal?.removeEventListener("abort", abortFromParent);
   }
 }
 
@@ -1747,6 +1837,7 @@ async function translateTextsWithAi(cleanTexts, targetLanguage, signal, options 
     model: config.model,
     temperature: 0,
     stream: false,
+    max_tokens: isLocalHyMt2Provider(config.provider) && profile === "subtitle" ? 48 : undefined,
     messages: [
       {
         role: "system",
@@ -1994,6 +2085,7 @@ function normalizeAsrProvider(value) {
   const normalized = String(value ?? "").trim().toLowerCase();
   if (["local-funasr-stream", "funasr-stream", "funasr-ws", "funasr-websocket"].includes(normalized)) return LOCAL_FUNASR_STREAM_PROVIDER;
   if (["local-nemotron-ja-stream", "nemotron-ja-stream", "sherpa-nemotron", "nemotron"].includes(normalized)) return LOCAL_NEMOTRON_STREAM_PROVIDER;
+  if (["local-vosk-ja-stream", "vosk-ja-stream", "vosk", "local-vosk"].includes(normalized)) return LOCAL_VOSK_STREAM_PROVIDER;
   if (["local-sensevoice-http", "local-sensevoice", "sensevoice", "funasr-http"].includes(normalized)) return LOCAL_SENSEVOICE_PROVIDER;
   if (["aliyun", "ali", "alibaba", "nls"].includes(normalized)) return "aliyun";
   if (["tencent", "tencentcloud", "qcloud"].includes(normalized)) return "tencent";
@@ -2003,16 +2095,17 @@ function normalizeAsrProvider(value) {
 }
 
 function isLocalAsrProvider(provider) {
-  return provider === LOCAL_FUNASR_STREAM_PROVIDER || provider === LOCAL_NEMOTRON_STREAM_PROVIDER || provider === LOCAL_SENSEVOICE_PROVIDER;
+  return provider === LOCAL_FUNASR_STREAM_PROVIDER || provider === LOCAL_NEMOTRON_STREAM_PROVIDER || provider === LOCAL_VOSK_STREAM_PROVIDER || provider === LOCAL_SENSEVOICE_PROVIDER;
 }
 
 function isLocalStreamingAsrProvider(provider) {
-  return provider === LOCAL_FUNASR_STREAM_PROVIDER || provider === LOCAL_NEMOTRON_STREAM_PROVIDER;
+  return provider === LOCAL_FUNASR_STREAM_PROVIDER || provider === LOCAL_NEMOTRON_STREAM_PROVIDER || provider === LOCAL_VOSK_STREAM_PROVIDER;
 }
 
 function getAsrProviderLabel(provider) {
   if (provider === LOCAL_FUNASR_STREAM_PROVIDER) return "本地 FunASR 流式";
   if (provider === LOCAL_NEMOTRON_STREAM_PROVIDER) return "本地 Nemotron 日语流式";
+  if (provider === LOCAL_VOSK_STREAM_PROVIDER) return "本地 Vosk 日语极速流式";
   if (provider === LOCAL_SENSEVOICE_PROVIDER) return "本地 SenseVoice HTTP";
   if (provider === "aliyun") return "阿里云百炼 / NLS";
   if (provider === "tencent") return "腾讯云 ASR";

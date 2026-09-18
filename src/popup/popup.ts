@@ -44,6 +44,15 @@ const ASR_PRESETS: Record<AsrProviderId, AsrPreset> = {
     },
     models: ["nemotron-ja-560ms-int8"],
   },
+  "local-vosk-ja-stream": {
+    hint: "使用本地 Vosk 小型日语流式模型。优先低延迟首字，适合实时网页视频字幕；准确率低于 Nemotron。",
+    fields: ["endpoint", "model"],
+    defaults: {
+      endpoint: "ws://127.0.0.1:10097",
+      model: "vosk-model-small-ja-0.22",
+    },
+    models: ["vosk-model-small-ja-0.22"],
+  },
   "local-sensevoice-http": {
     hint: "使用现有 SenseVoice 文件转写接口。它是近实时兼容模式，不适合低于 1 秒的字幕延迟。",
     fields: ["endpoint", "model"],

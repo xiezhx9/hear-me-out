@@ -85,7 +85,7 @@ npm run dev:server
 
 | 服务 | 说明 |
 |------|------|
-| 本地 Hy-MT2 | llama.cpp OpenAI 兼容服务，不需要云端密钥 |
+| 本地 OpenAI 兼容模型 | 连接本地推理服务，可使用自定义翻译模型，无需云端密钥 |
 | 微软翻译 | 免费，无需 API Key，速度快 |
 | DeepSeek | 国产 AI，性价比高 |
 | 小米 MiMo | 小米大模型 |
@@ -101,9 +101,9 @@ npm run dev:server
 
 | 服务 | 说明 |
 |------|------|
-| 本地 Nemotron 日语流式 | 推荐的日语路径；Sherpa-ONNX 直接嵌入后端，识别语言固定为 `ja` |
-| 本地 FunASR 流式 | 中文兼容路径；需另行部署兼容 `2pass` 协议的常驻流式模型 |
-| 本地 SenseVoice HTTP | 兼容已部署的 GGUF 文件转写接口；近实时，不适合亚秒级体验 |
+| 本地 WebSocket ASR | 连接常驻的自定义流式服务，适合低延迟字幕 |
+| 本地进程内 ASR | 通过 Sherpa-ONNX 加载兼容模型，支持按会话管理识别流 |
+| 本地 HTTP ASR | 连接文件转写接口，以分段方式提供近实时兼容能力 |
 | 火山引擎 / 豆包 | 默认推荐，流式语音识别 2.0 |
 | 阿里云百炼 / Qwen-ASR | 实时语音识别 |
 | 腾讯云 ASR | 实时语音识别 |
@@ -131,25 +131,27 @@ TRANSLATION_PROVIDER=microsoft
 # AI_TRANSLATION_MODEL=deepseek-v4-flash
 # AI_TRANSLATION_DISABLE_THINKING=true
 
-# 本地实时 FunASR（推荐；需要先启动常驻 WebSocket 服务）
+# 本地流式 ASR（需要先启动兼容的常驻 WebSocket 服务）
 # ASR_PROVIDER=local-funasr-stream
 # ASR_ENDPOINT=ws://127.0.0.1:10095
-# ASR_MODEL=funasr-2pass
+# ASR_MODEL=your-streaming-model
 
-# 本地 Hy-MT2
+# 本地翻译模型（OpenAI Chat Completions 兼容接口）
 # TRANSLATION_PROVIDER=local-hy-mt2
 # AI_TRANSLATION_BASE_URL=http://127.0.0.1:8001/v1
-# AI_TRANSLATION_MODEL=hy-mt2
+# AI_TRANSLATION_MODEL=your-translation-model
 
-# 本地 Nemotron 日语流式（推荐）
+# 本地进程内流式 ASR（Sherpa-ONNX 兼容模型）
 # ASR_PROVIDER=local-nemotron-ja-stream
-# ASR_MODEL_DIR=C:\path\to\nemotron-ja-streaming
+# ASR_MODEL_DIR=C:\path\to\streaming-asr-model
 # ASR_LANGUAGE=ja
 # SHERPA_ONNX_PROVIDER=cpu
 # SHERPA_ONNX_NUM_THREADS=2
 ```
 
-Nemotron 模型目录需要包含 `encoder.int8.onnx`、`decoder.int8.onnx`、`joiner.int8.onnx` 和 `tokens.txt`。项目使用 `sherpa-onnx-node` 的原生流式 API，每个浏览器会话对应一个识别流；日语语言会在会话创建时固定为 `ja`。当前 Windows npm 预编译包使用 CPU Execution Provider，启动脚本会因此将它配置为 CPU；请以本机实测的首个 partial 延迟为准。
+内置本地 Provider 是自定义模型接入的预设适配器。WebSocket Provider 适合常驻流式服务；进程内 Provider 的模型目录需包含 `encoder.int8.onnx`、`decoder.int8.onnx`、`joiner.int8.onnx` 和 `tokens.txt`；HTTP Provider 用于兼容已有文件转写服务。模型、端点和运行参数均通过环境变量配置，不依赖个人目录。
+
+低延迟模式会对部分结果做去抖、取消过期翻译，并优先处理最终字幕。实际延迟由 ASR 模型的流式步长、翻译模型速度和硬件资源共同决定。
 
 更多配置项请参考 `.env.example`。
 

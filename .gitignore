@@ -5,3 +5,5 @@ dist/
 AGENTS.md
 npm-debug.log*
 releases/
+__pycache__/
+*.pyc
